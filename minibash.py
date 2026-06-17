@@ -15,6 +15,20 @@ from signal_handler import SignalHandler
 from alias_manager import AliasManager, TypeCommand
 
 
+class LoopControl(Exception):
+    pass
+
+
+class BreakSignal(LoopControl):
+    def __init__(self, level=1):
+        self.level = level
+
+
+class ContinueSignal(LoopControl):
+    def __init__(self, level=1):
+        self.level = level
+
+
 class Shell:
     def __init__(self):
         self.variables = {}
@@ -771,6 +785,26 @@ class Shell:
                     code = 1
             self.last_exit_code = code
             return code
+        elif cmd == 'break':
+            level = 1
+            if args:
+                try:
+                    level = int(args[0])
+                    if level < 1:
+                        level = 1
+                except ValueError:
+                    pass
+            raise BreakSignal(level)
+        elif cmd == 'continue':
+            level = 1
+            if args:
+                try:
+                    level = int(args[0])
+                    if level < 1:
+                        level = 1
+                except ValueError:
+                    pass
+            raise ContinueSignal(level)
         return None
 
     def source_script(self, filename):
@@ -783,6 +817,8 @@ class Shell:
             with open(expanded, 'r') as f:
                 lines = f.readlines()
             return self.execute_lines(lines)
+        except LoopControl:
+            raise
         except Exception as e:
             print(f"minibash: source: {filename}: {e}", file=sys.stderr)
             self.last_exit_code = 1
@@ -895,6 +931,8 @@ class Shell:
             if result != 0:
                 self.signal_handler.trigger_err()
             return result
+        except LoopControl:
+            raise
         except Exception as e:
             print(f"minibash: error: {e}", file=sys.stderr)
             self.last_exit_code = 1
@@ -1023,14 +1061,40 @@ class Shell:
         segments = []
         current = []
         pending_op = None
+        compound_stack = []
+        paren_depth = 0
+        brace_depth = 0
         for t in tokens:
-            if t[0] == 'op' and t[1] in ('&&', '||'):
-                if current:
-                    segments.append((pending_op, current))
-                    current = []
-                pending_op = t[1]
-            else:
-                current.append(t)
+            kind, val = t
+            if kind == 'op' and val in ('&&', '||'):
+                if paren_depth == 0 and brace_depth == 0 and not compound_stack:
+                    if current:
+                        segments.append((pending_op, current))
+                        current = []
+                    pending_op = val
+                    continue
+            if val == '(':
+                paren_depth += 1
+            elif val == ')':
+                if paren_depth > 0:
+                    paren_depth -= 1
+            elif val == '{':
+                brace_depth += 1
+            elif val == '}':
+                if brace_depth > 0:
+                    brace_depth -= 1
+            elif val in ('if', 'for', 'while', 'case', 'select'):
+                compound_stack.append(val)
+            elif val == 'fi':
+                if compound_stack and compound_stack[-1] == 'if':
+                    compound_stack.pop()
+            elif val == 'esac':
+                if compound_stack and compound_stack[-1] == 'case':
+                    compound_stack.pop()
+            elif val == 'done':
+                if compound_stack and compound_stack[-1] in ('for', 'while', 'select'):
+                    compound_stack.pop()
+            current.append(t)
         if current:
             segments.append((pending_op, current))
         if not segments:
@@ -1169,7 +1233,8 @@ class Shell:
     def _try_builtin_with_fds(self, cmd, args, stdin_fd, stdout_fd, redirs):
         all_builtins = ('echo', 'pwd', 'cd', 'exit', 'export', 'unset', 'history',
                        'set', 'source', 'read', 'true', 'false', ':',
-                       'jobs', 'fg', 'bg', 'wait', 'alias', 'unalias', 'type', 'trap')
+                       'jobs', 'fg', 'bg', 'wait', 'alias', 'unalias', 'type', 'trap',
+                       'break', 'continue')
         if cmd not in all_builtins:
             return None
         old_out = None
@@ -1477,7 +1542,19 @@ class Shell:
             cond_code = self._eval_condition(cond_text)
             if cond_code != 0:
                 break
-            result = self._exec_simple_text(body_text)
+            try:
+                result = self._exec_simple_text(body_text)
+            except BreakSignal as bs:
+                if bs.level <= 1:
+                    self.last_exit_code = result
+                    return result
+                else:
+                    raise BreakSignal(bs.level - 1)
+            except ContinueSignal as cs:
+                if cs.level <= 1:
+                    continue
+                else:
+                    raise ContinueSignal(cs.level - 1)
             if not self.running:
                 return result
             if self.set_e and result != 0:
@@ -1518,7 +1595,19 @@ class Shell:
         result = 0
         for val in iter_values:
             self.set_var(var_name, val)
-            result = self._exec_simple_text(body_text)
+            try:
+                result = self._exec_simple_text(body_text)
+            except BreakSignal as bs:
+                if bs.level <= 1:
+                    self.last_exit_code = result
+                    return result
+                else:
+                    raise BreakSignal(bs.level - 1)
+            except ContinueSignal as cs:
+                if cs.level <= 1:
+                    continue
+                else:
+                    raise ContinueSignal(cs.level - 1)
             if not self.running:
                 return result
             if self.set_e and result != 0:
@@ -1787,7 +1876,19 @@ class Shell:
                         self.set_var(var_name, '')
                 else:
                     self.set_var(var_name, '')
-                result = self._exec_simple_text(body_text)
+                try:
+                    result = self._exec_simple_text(body_text)
+                except BreakSignal as bs:
+                    if bs.level <= 1:
+                        self.last_exit_code = result
+                        return result
+                    else:
+                        raise BreakSignal(bs.level - 1)
+                except ContinueSignal as cs:
+                    if cs.level <= 1:
+                        continue
+                    else:
+                        raise ContinueSignal(cs.level - 1)
                 if not self.running:
                     return result
                 if self.set_e and result != 0:
@@ -1929,7 +2030,8 @@ class Shell:
                         self._completions.append(fn)
                 builtins = ['cd', 'pwd', 'echo', 'exit', 'export', 'unset', 'history',
                             'set', 'source', 'read', 'true', 'false',
-                            'jobs', 'fg', 'bg', 'wait', 'alias', 'unalias', 'type', 'trap']
+                            'jobs', 'fg', 'bg', 'wait', 'alias', 'unalias', 'type', 'trap',
+                            'break', 'continue']
                 for b in builtins:
                     if b.startswith(text):
                         self._completions.append(b)
@@ -2003,6 +2105,12 @@ class Shell:
             except EOFError:
                 print()
                 break
+            except LoopControl as lc:
+                if isinstance(lc, BreakSignal):
+                    print("minibash: break: only meaningful in a `for', `while', or `until' loop", file=sys.stderr)
+                else:
+                    print("minibash: continue: only meaningful in a `for', `while', or `until' loop", file=sys.stderr)
+                self.last_exit_code = 1
         self.signal_handler.trigger_exit()
         self.signal_handler.reset_all()
         self.save_history()
@@ -2019,6 +2127,12 @@ class Shell:
             self.signal_handler.trigger_exit()
             self.signal_handler.reset_all()
             sys.exit(code)
+        except LoopControl as lc:
+            if isinstance(lc, BreakSignal):
+                print(f"minibash: break: only meaningful in a `for', `while', or `until' loop", file=sys.stderr)
+            else:
+                print(f"minibash: continue: only meaningful in a `for', `while', or `until' loop", file=sys.stderr)
+            sys.exit(1)
         except Exception as e:
             print(f"minibash: {filename}: {e}", file=sys.stderr)
             sys.exit(1)
