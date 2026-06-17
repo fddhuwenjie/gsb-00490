@@ -74,8 +74,9 @@ class TypeCommand:
     def get_type(self, name):
         if name in ('cd', 'pwd', 'echo', 'exit', 'export', 'unset', 'history',
                      'set', 'source', 'read', 'true', 'false', ':',
+                     'break', 'continue',
                      'jobs', 'fg', 'bg', 'wait', 'alias', 'unalias',
-                     'type', 'trap'):
+                     'type', 'trap', 'case', 'select'):
             return 'builtin', name
         if hasattr(self.shell, 'alias_manager') and self.shell.alias_manager.has_alias(name):
             value = self.shell.alias_manager.lookup(name)
