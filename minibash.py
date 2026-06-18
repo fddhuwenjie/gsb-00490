@@ -7,12 +7,21 @@ import re
 import readline
 import tempfile
 import signal
+import fnmatch
 
 from job_control import JobManager
 from heredoc import HeredocParser
 from arithmetic import ArithmeticEvaluator, TestEvaluator
 from signal_handler import SignalHandler
 from alias_manager import AliasManager, TypeCommand
+
+
+class BreakLoop(Exception):
+    pass
+
+
+class ContinueLoop(Exception):
+    pass
 
 
 class Shell:
@@ -771,6 +780,10 @@ class Shell:
                     code = 1
             self.last_exit_code = code
             return code
+        elif cmd == 'break':
+            raise BreakLoop()
+        elif cmd == 'continue':
+            raise ContinueLoop()
         return None
 
     def source_script(self, filename):
@@ -825,15 +838,21 @@ class Shell:
             return False
         kinds = [t[0] for t in tokens]
         vals = [t[1] for t in tokens]
-        kw_set = {'if', 'while', 'for', 'function'}
+        kw_set = {'if', 'while', 'for', 'function', 'case', 'select'}
         if vals[0] in kw_set:
-            if 'fi' not in vals and 'done' not in vals and '}' not in vals:
+            if vals[0] == 'case':
+                if 'esac' not in vals:
+                    return True
+            elif vals[0] == 'select':
+                if 'done' not in vals:
+                    return True
+            elif 'fi' not in vals and 'done' not in vals and '}' not in vals:
                 return True
         if '(' in vals and ')' not in vals:
             return True
         if '{' in vals and '}' not in vals:
             return True
-        if vals[0] == 'do' or vals[0] == 'then':
+        if vals[0] in ('do', 'then', 'in'):
             return True
         return False
 
@@ -868,6 +887,10 @@ class Shell:
             return self._exec_while_from_text(text)
         elif first_val == 'for':
             return self._exec_for_from_text(text)
+        elif first_val == 'case':
+            return self._exec_case_from_text(text)
+        elif first_val == 'select':
+            return self._exec_select_from_text(text)
         elif first_val == 'function' or self._is_func_def(tokens):
             return self._def_func_from_text(text, tokens)
         else:
@@ -1071,7 +1094,8 @@ class Shell:
     def _try_builtin_with_fds(self, cmd, args, stdin_fd, stdout_fd, redirs):
         all_builtins = ('echo', 'pwd', 'cd', 'exit', 'export', 'unset', 'history',
                        'set', 'source', 'read', 'true', 'false', ':',
-                       'jobs', 'fg', 'bg', 'wait', 'alias', 'unalias', 'type', 'trap')
+                       'jobs', 'fg', 'bg', 'wait', 'alias', 'unalias', 'type', 'trap',
+                       'break', 'continue')
         if cmd not in all_builtins:
             return None
         old_out = None
@@ -1373,7 +1397,13 @@ class Shell:
             cond_code = self._eval_condition(cond_text)
             if cond_code != 0:
                 break
-            result = self._exec_simple_text(body_text)
+            try:
+                result = self._exec_simple_text(body_text)
+            except BreakLoop:
+                self.last_exit_code = 0
+                return 0
+            except ContinueLoop:
+                continue
             if not self.running:
                 return result
             if self.set_e and result != 0:
@@ -1414,11 +1444,205 @@ class Shell:
         result = 0
         for val in iter_values:
             self.set_var(var_name, val)
-            result = self._exec_simple_text(body_text)
+            try:
+                result = self._exec_simple_text(body_text)
+            except BreakLoop:
+                self.last_exit_code = 0
+                return 0
+            except ContinueLoop:
+                continue
             if not self.running:
                 return result
             if self.set_e and result != 0:
                 return result
+        self.last_exit_code = result
+        return result
+
+    def _exec_case_from_text(self, text):
+        flat = text.replace('\n', ' ; ')
+        tokens = self.tokenize(flat)
+        vals = [t[1] for t in tokens]
+        try:
+            case_pos = vals.index('case')
+            in_pos = vals.index('in')
+            esac_pos = len(vals) - 1 - vals[::-1].index('esac')
+        except ValueError:
+            print("minibash: syntax error: incomplete case", file=sys.stderr)
+            self.last_exit_code = 2
+            return 2
+
+        word_tokens = tokens[case_pos + 1:in_pos]
+        word_value = self._resolve_case_word(word_tokens)
+
+        body_tokens = tokens[in_pos + 1:esac_pos]
+        clauses = self._parse_case_clauses(body_tokens)
+        if clauses is None:
+            print("minibash: syntax error: invalid case clause", file=sys.stderr)
+            self.last_exit_code = 2
+            return 2
+
+        result = 0
+        matched = False
+        for patterns, clause_body_tokens in clauses:
+            for pattern in patterns:
+                expanded_pattern = self.expand_string(pattern)
+                if fnmatch.fnmatchcase(word_value, expanded_pattern):
+                    clause_body_text = self._tokens_to_text(clause_body_tokens)
+                    result = self._exec_simple_text(clause_body_text)
+                    matched = True
+                    break
+            if matched:
+                break
+
+        self.last_exit_code = result
+        return result
+
+    def _resolve_case_word(self, word_tokens):
+        parts = []
+        for tok in word_tokens:
+            if tok[0] == 'op' and tok[1] == ';':
+                continue
+            parts.append(self.resolve_token(tok))
+        return ''.join(parts)
+
+    def _parse_case_clauses(self, body_tokens):
+        clauses = []
+        i = 0
+        n = len(body_tokens)
+        while i < n:
+            while i < n and body_tokens[i][0] == 'op' and body_tokens[i][1] == ';':
+                i += 1
+            if i >= n:
+                break
+
+            patterns = []
+            current_pattern_parts = []
+            has_paren = False
+            while i < n:
+                if body_tokens[i][0] == 'op' and body_tokens[i][1] == ')':
+                    has_paren = True
+                    if current_pattern_parts:
+                        patterns.append(''.join(current_pattern_parts))
+                        current_pattern_parts = []
+                    i += 1
+                    break
+                elif body_tokens[i][0] == 'op' and body_tokens[i][1] == '|':
+                    if current_pattern_parts:
+                        patterns.append(''.join(current_pattern_parts))
+                        current_pattern_parts = []
+                    i += 1
+                else:
+                    if body_tokens[i][0] in ('sq', 'dq'):
+                        current_pattern_parts.append(body_tokens[i][1])
+                    else:
+                        current_pattern_parts.append(body_tokens[i][1])
+                    i += 1
+
+            if not has_paren:
+                break
+
+            if not patterns:
+                patterns = ['']
+
+            body_start = i
+            while i < n:
+                if (body_tokens[i][0] == 'op' and body_tokens[i][1] == ';' and
+                    i + 1 < n and body_tokens[i + 1][0] == 'op' and body_tokens[i + 1][1] == ';'):
+                    break
+                i += 1
+
+            clause_body_tokens = body_tokens[body_start:i]
+
+            if i + 1 < n and body_tokens[i][1] == ';' and body_tokens[i + 1][1] == ';':
+                clauses.append((patterns, clause_body_tokens))
+                i += 2
+            else:
+                clauses.append((patterns, clause_body_tokens))
+                break
+
+        return clauses
+
+    def _exec_select_from_text(self, text):
+        flat = text.replace('\n', ' ; ')
+        tokens = self.tokenize(flat)
+        vals = [t[1] for t in tokens]
+        if len(tokens) < 2:
+            print("minibash: syntax error: select needs variable", file=sys.stderr)
+            return 2
+        var_name = vals[1]
+        try:
+            do_pos = vals.index('do')
+        except ValueError:
+            print("minibash: syntax error: incomplete select", file=sys.stderr)
+            return 2
+        try:
+            done_pos = len(vals) - 1 - vals[::-1].index('done')
+        except ValueError:
+            print("minibash: syntax error: incomplete select", file=sys.stderr)
+            return 2
+
+        try:
+            in_pos = vals.index('in')
+            has_in = in_pos < do_pos
+        except ValueError:
+            has_in = False
+
+        if has_in:
+            iter_tokens = tokens[in_pos + 1:do_pos]
+            iter_tokens = [t for t in iter_tokens if not (t[0] == 'op' and t[1] == ';')]
+            iter_values = self.resolve_tokens(iter_tokens)
+            iter_values = self.expand_globs(iter_values)
+        else:
+            iter_values = list(self.positional_params)
+
+        body_text = self._tokens_to_text(tokens[do_pos + 1:done_pos])
+        result = 0
+
+        if not iter_values:
+            self.last_exit_code = 0
+            return 0
+
+        ps3 = self.get_var('PS3') or '#? '
+
+        for idx, item in enumerate(iter_values, 1):
+            print(f"{idx}) {item}")
+
+        try:
+            while True:
+                try:
+                    reply = input(ps3)
+                except EOFError:
+                    break
+
+                self.set_var('REPLY', reply)
+
+                reply_stripped = reply.strip()
+                if reply_stripped == '':
+                    continue
+
+                try:
+                    choice = int(reply_stripped)
+                    if 1 <= choice <= len(iter_values):
+                        self.set_var(var_name, iter_values[choice - 1])
+                    else:
+                        self.set_var(var_name, '')
+                except ValueError:
+                    self.set_var(var_name, '')
+
+                try:
+                    result = self._exec_simple_text(body_text)
+                except BreakLoop:
+                    self.last_exit_code = 0
+                    return 0
+                except ContinueLoop:
+                    continue
+                if not self.running:
+                    return result
+                if self.set_e and result != 0:
+                    return result
+        except KeyboardInterrupt:
+            print()
+
         self.last_exit_code = result
         return result
 
@@ -1554,7 +1778,8 @@ class Shell:
                         self._completions.append(fn)
                 builtins = ['cd', 'pwd', 'echo', 'exit', 'export', 'unset', 'history',
                             'set', 'source', 'read', 'true', 'false',
-                            'jobs', 'fg', 'bg', 'wait', 'alias', 'unalias', 'type', 'trap']
+                            'jobs', 'fg', 'bg', 'wait', 'alias', 'unalias', 'type', 'trap',
+                            'break', 'continue', 'case', 'esac', 'select', 'in']
                 for b in builtins:
                     if b.startswith(text):
                         self._completions.append(b)
